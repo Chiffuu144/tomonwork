@@ -45,17 +45,181 @@ app.delete('/api/subjects/:id',auth,role('faculty'),async(req,res)=>{const subje
 app.get('/api/topics',auth,async(req,res)=>res.json({topics:await Topic.find(req.query.subjectId?{subjectId:req.query.subjectId}:{}).sort({topicNumber:1})}));
 app.get('/api/topics/access',auth,async(req,res)=>{const topicNumber=Number(req.query.topicNumber||1);if(req.user.role==='faculty'||topicNumber<=1)return res.json({allowed:true});const allowed=Boolean(await Score.exists({studentId:req.user.userId,subjectId:req.query.subjectId,topicNumber:topicNumber-1,passed:true}));res.json({allowed,reason:allowed?'':'Pass the previous topic quiz with at least 75% first.'});});
 const ownedSubject=async(subjectId,user)=>user.role==='faculty'?Subject.findOne({_id:subjectId,facultyId:user.userId}):Subject.findOne({_id:subjectId,enrolledStudents:user.userId});
+const validateQuizPayload=quiz=>{
+  if(!quiz.topicId||!quiz.subjectId||!String(quiz.title||'').trim()||!Array.isArray(quiz.questions)||quiz.questions.length<1)return 'A topic, title, and at least one question are required';
+  if(quiz.questions.length>20)return 'Maximum 20 questions per quiz';
+  const timeLimit=Number(quiz.timeLimit);
+  const passingScore=Number(quiz.passingScore);
+  if(!Number.isInteger(timeLimit)||timeLimit<60||timeLimit>10800)return 'Time limit must be between 1 and 180 minutes';
+  if(!Number.isFinite(passingScore)||passingScore<1||passingScore>100)return 'Passing score must be between 1 and 100';
+  for(const [index,question] of quiz.questions.entries()){
+    const type=question.type;
+    const answer=String(question.correctAnswer||'').trim();
+    const points=Number(question.points||1);
+    if(!['multiple_choice','true_false','identification'].includes(type)||!String(question.questionText||'').trim()||!answer)return `Question ${index+1} is incomplete`;
+    if(!Number.isFinite(points)||points<=0)return `Question ${index+1} must have a positive point value`;
+    if(type==='multiple_choice'){
+      const choices=(question.choices||[]).map(choice=>String(choice||'').trim()).filter(Boolean);
+      if(choices.length<2||new Set(choices.map(choice=>choice.toLowerCase())).size!==choices.length)return `Question ${index+1} must have at least two unique choices`;
+      if(!choices.some(choice=>choice.toLowerCase()===answer.toLowerCase()))return `Question ${index+1} correct answer must match one of its choices`;
+    }
+    if(type==='true_false'&&!['true','false'].includes(answer.toLowerCase()))return `Question ${index+1} answer must be True or False`;
+  }
+  return '';
+};
+const studentQuiz=quiz=>({
+  _id:quiz._id,
+  topicId:quiz.topicId,
+  subjectId:quiz.subjectId,
+  title:quiz.title,
+  timeLimit:quiz.timeLimit,
+  passingScore:quiz.passingScore,
+  questionCount:quiz.questions.length,
+  isActive:quiz.isActive,
+  questions:quiz.questions.map(({_id,type,questionText,choices,points})=>({_id,type,questionText,choices,points}))
+});
+const studentCanAccessQuiz=async(quiz,studentId)=>{
+  const topic=await Topic.findOne({_id:quiz.topicId,subjectId:quiz.subjectId}).select('topicNumber');
+  if(!topic)return false;
+  return Number(topic.topicNumber)<=1||Boolean(await Score.exists({
+    studentId,subjectId:quiz.subjectId,topicNumber:Number(topic.topicNumber)-1,passed:true
+  }));
+};
 app.get('/api/topics/subject/:subjectId/topic/:topicNumber',auth,async(req,res)=>{const subject=await ownedSubject(req.params.subjectId,req.user);if(!subject)return res.status(403).json({error:'You do not have access to this subject'});const topic=await Topic.findOne({subjectId:req.params.subjectId,topicNumber:Number(req.params.topicNumber)});if(!topic)return res.status(404).json({error:'Topic content not found'});if(req.user.role==='student'&&Number(req.params.topicNumber)>1&&!await Score.exists({studentId:req.user.userId,subjectId:req.params.subjectId,topicNumber:Number(req.params.topicNumber)-1,passed:true}))return res.status(403).json({error:'Pass the previous topic quiz with at least 75% first.'});res.json({topic});});
 app.get('/api/topics/:id/file',auth,async(req,res)=>{const topic=await Topic.findById(req.params.id);if(!topic)return res.status(404).json({error:'Topic not found'});const subject=await ownedSubject(topic.subjectId,req.user);if(!subject)return res.status(403).json({error:'You do not have access to this topic'});const storedName=topic.uploadedFileUrl?path.basename(new URL(topic.uploadedFileUrl).pathname):'';const filePath=storedName?path.join(uploadDir,storedName):'';if(!filePath||!fs.existsSync(filePath))return res.status(404).json({error:'Uploaded presentation file is missing from the server'});const extension=path.extname(topic.uploadedFileName||storedName).toLowerCase();if(!['.pdf','.ppt','.pptx'].includes(extension))return res.status(415).json({error:'Unsupported presentation format'});res.type(extension);res.set('Content-Disposition',extension==='.pdf'?'inline':`attachment; filename="${path.basename(topic.uploadedFileName||storedName).replace(/"/g,'')}"`);res.sendFile(filePath);});
 app.get('/api/topics/:id',auth,async(req,res)=>{const topic=await Topic.findById(req.params.id);if(!topic)return res.status(404).json({error:'Topic not found'});res.json({topic});});
 app.post('/api/topics',auth,role('faculty'),async(req,res)=>{const b=req.body;const topic=await Topic.findOneAndUpdate({subjectId:b.subjectId,topicNumber:b.topicNumber},b,{upsert:true,new:true,setDefaultsOnInsert:true});res.status(201).json({topic});});
 app.put('/api/topics/:id',auth,role('faculty'),async(req,res)=>{const existing=await Topic.findById(req.params.id);if(!existing)return res.status(404).json({error:'Topic not found'});const subject=await Subject.findOne({_id:existing.subjectId,facultyId:req.user.userId});if(!subject)return res.status(403).json({error:'Only the subject faculty can edit this topic'});const b=req.body;const update={};['title','description','richTextContent','uploadedFileUrl','uploadedFileName','customSlides','summary','isVerifiedComplete','isActive'].forEach(key=>{if(b[key]!==undefined)update[key]=b[key];});if(b.lessonContent!==undefined)update.richTextContent=b.lessonContent;if(b.summaryCard!==undefined)update.summary=b.summaryCard;const topic=await Topic.findByIdAndUpdate(req.params.id,update,{new:true,runValidators:true});res.json({topic});});
 app.post('/api/topics/:id/upload',auth,role('faculty'),upload.single('file'),async(req,res)=>{const existing=await Topic.findById(req.params.id);if(!existing)return res.status(404).json({error:'Topic not found'});const subject=await Subject.findOne({_id:existing.subjectId,facultyId:req.user.userId});if(!subject)return res.status(403).json({error:'Only the subject faculty can upload to this topic'});if(!req.file)return res.status(400).json({error:'File is required'});const extension=path.extname(req.file.originalname).toLowerCase();if(!['.pdf','.ppt','.pptx'].includes(extension)){fs.unlinkSync(req.file.path);return res.status(400).json({error:'Only PDF, PPT, and PPTX files are allowed'});}const uploadedFileUrl=`${process.env.PUBLIC_API_URL||`http://localhost:${port}`}/uploads/${req.file.filename}`;const topic=await Topic.findByIdAndUpdate(existing._id,{uploadedFileUrl,uploadedFileName:req.file.originalname,pdfUrl:extension==='.pdf'?uploadedFileUrl:''},{new:true});res.status(201).json({topic});});
-app.get('/api/quizzes',auth,async(req,res)=>{const q={};if(req.query.topicId)q.topicId=req.query.topicId;if(req.query.subjectId)q.subjectId=req.query.subjectId;const quizzes=await Quiz.find(q).sort({createdAt:-1});res.json({quizzes:req.user.role==='student'?quizzes.map(x=>({ _id:x._id,topicId:x.topicId,subjectId:x.subjectId,title:x.title,timeLimit:x.timeLimit,passingScore:x.passingScore,questionCount:x.questions.length,isActive:x.isActive,questions:x.questions.map(({_id,type,questionText,choices,points})=>({_id,type,questionText,choices,points}))})):quizzes});});
-app.get('/api/quizzes/:id',auth,async(req,res)=>{const quiz=await Quiz.findById(req.params.id);if(!quiz)return res.status(404).json({error:'Quiz not found'});res.json({quiz});});
-app.post('/api/quizzes',auth,role('faculty'),async(req,res)=>{if(!req.body.topicId||!req.body.subjectId||!req.body.title||!req.body.questions?.length)return res.status(400).json({error:'Missing required quiz fields'});if(req.body.questions.length>20)return res.status(400).json({error:'Maximum 20 questions per quiz'});res.status(201).json({quiz:await Quiz.create(req.body)});});
-app.get('/api/scores',auth,async(req,res)=>{const q={};if(req.query.subjectId)q.subjectId=req.query.subjectId;if(req.query.topicId)q.topicId=req.query.topicId;q.studentId=req.user.role==='student'?req.user.userId:req.query.studentId;res.json({scores:await Score.find(q).populate('studentId','fullName studentId yearLevel section').populate('quizId','title').sort({topicNumber:1,createdAt:-1})});});
-app.post('/api/scores',auth,role('student'),async(req,res)=>{const b=req.body;const quiz=await Quiz.findById(b.quizId);if(!quiz)return res.status(404).json({error:'Quiz not found'});const topicNumber=Number(b.topicNumber||1);if(topicNumber>1&&!await Score.exists({studentId:req.user.userId,subjectId:b.subjectId,topicNumber:topicNumber-1,passed:true}))return res.status(403).json({error:`Pass Topic ${topicNumber-1} before taking this quiz`});let rawScore=0,totalPoints=0;const answers=[];for(const q of quiz.questions){const answer=(b.answers||{})[q._id.toString()]||'';const isCorrect=answer.trim().toLowerCase()===q.correctAnswer.trim().toLowerCase();totalPoints+=q.points;if(isCorrect)rawScore+=q.points;answers.push({questionId:q._id,answer,isCorrect});}const percentage=totalPoints?Math.round(rawScore/totalPoints*100):0;const passed=percentage>=quiz.passingScore;const score=await Score.create({studentId:req.user.userId,quizId:b.quizId,topicId:b.topicId,subjectId:b.subjectId,topicNumber,rawScore,totalPoints,percentage,passed,answers,timeTaken:b.timeTaken||0,attemptNumber:await Score.countDocuments({studentId:req.user.userId,quizId:b.quizId})+1});res.status(201).json({score:{...score.toObject(),message:passed?`Congratulations! You scored ${percentage}%. Topic ${topicNumber+1<=6?topicNumber+1:''} unlocked.`:`Score ${percentage}% < 75%. Review the topic content and retry.`}});});
-app.get('/api/scores/matrix',auth,role('faculty'),async(req,res)=>{const subjectId=req.query.subjectId;if(!subjectId)return res.status(400).json({error:'subjectId is required'});const scores=await Score.find({subjectId}).populate('studentId','fullName studentId').sort({createdAt:-1});const matrix=new Map();for(const score of scores){const student=score.studentId;if(!student)continue;const key=String(student._id);if(!matrix.has(key))matrix.set(key,{studentName:student.fullName,studentId:student.studentId||'',scores:{},overall:0,status:'INCOMPLETE'});const row=matrix.get(key);row.scores[score.topicNumber]=Math.max(row.scores[score.topicNumber]||0,score.percentage);}const rows=[...matrix.values()].map(row=>{const values=[1,2,3,4,5,6].map(n=>row.scores[n]).filter(value=>typeof value==='number');row.overall=values.length?Math.round(values.reduce((a,b)=>a+b,0)/6):0;row.status=values.length===6&&values.every(value=>value>=75)?'PASSED':'INCOMPLETE';return row;});res.json({matrix:rows});});
+app.get('/api/quizzes',auth,async(req,res)=>{
+  const query={};
+  if(req.query.subjectId){
+    if(!await ownedSubject(req.query.subjectId,req.user))return res.status(403).json({error:'You do not have access to this subject'});
+    query.subjectId=req.query.subjectId;
+  }else{
+    const subjectQuery=req.user.role==='faculty'?{facultyId:req.user.userId}:{enrolledStudents:req.user.userId};
+    query.subjectId={$in:await Subject.distinct('_id',subjectQuery)};
+  }
+  if(req.query.topicId){
+    const topic=await Topic.findById(req.query.topicId);
+    if(!topic||!await ownedSubject(topic.subjectId,req.user))return res.status(403).json({error:'You do not have access to this topic'});
+    query.topicId=topic._id;
+  }
+  const quizzes=await Quiz.find(query).sort({createdAt:-1});
+  const availableQuizzes=req.user.role==='student'
+    ?await Promise.all(quizzes.filter(quiz=>quiz.isActive).map(async quiz=>await studentCanAccessQuiz(quiz,req.user.userId)?studentQuiz(quiz):null))
+    :quizzes;
+  res.json({quizzes:req.user.role==='student'?availableQuizzes.filter(Boolean):availableQuizzes});
+});
+app.get('/api/quizzes/:id',auth,async(req,res)=>{
+  const quiz=await Quiz.findById(req.params.id);
+  if(!quiz)return res.status(404).json({error:'Quiz not found'});
+  if(!await ownedSubject(quiz.subjectId,req.user))return res.status(403).json({error:'You do not have access to this quiz'});
+  if(req.user.role==='student'&&!quiz.isActive)return res.status(404).json({error:'Quiz not found'});
+  if(req.user.role==='student'&&!await studentCanAccessQuiz(quiz,req.user.userId))return res.status(403).json({error:'Pass the previous topic quiz before viewing this quiz'});
+  res.json({quiz:req.user.role==='student'?studentQuiz(quiz):quiz});
+});
+app.post('/api/quizzes',auth,role('faculty'),async(req,res)=>{
+  const validationError=validateQuizPayload(req.body);
+  if(validationError)return res.status(400).json({error:validationError});
+  const topic=await Topic.findOne({_id:req.body.topicId,subjectId:req.body.subjectId});
+  if(!topic)return res.status(400).json({error:'The selected topic does not belong to this subject'});
+  if(!await ownedSubject(req.body.subjectId,req.user))return res.status(403).json({error:'Only the subject faculty can create its quiz'});
+  const payload={...req.body};
+  delete payload._id;
+  const quiz=await Quiz.findOneAndUpdate({topicId:topic._id},payload,{new:true,upsert:true,runValidators:true,setDefaultsOnInsert:true});
+  res.status(201).json({quiz});
+});
+app.put('/api/quizzes/:id',auth,role('faculty'),async(req,res)=>{
+  const validationError=validateQuizPayload(req.body);
+  if(validationError)return res.status(400).json({error:validationError});
+  const quiz=await Quiz.findById(req.params.id);
+  if(!quiz)return res.status(404).json({error:'Quiz not found'});
+  if(String(quiz.topicId)!==String(req.body.topicId)||String(quiz.subjectId)!==String(req.body.subjectId))return res.status(400).json({error:'Quiz topic and subject cannot be changed'});
+  const topic=await Topic.findOne({_id:quiz.topicId,subjectId:quiz.subjectId});
+  if(!topic)return res.status(400).json({error:'The selected topic does not belong to this subject'});
+  if(!await ownedSubject(quiz.subjectId,req.user))return res.status(403).json({error:'Only the subject faculty can edit its quiz'});
+  const payload={...req.body};
+  delete payload._id;
+  const updated=await Quiz.findByIdAndUpdate(quiz._id,payload,{new:true,runValidators:true});
+  res.json({quiz:updated});
+});
+app.get('/api/scores',auth,async(req,res)=>{
+  const query={};
+  if(req.user.role==='student')query.studentId=req.user.userId;
+  else if(req.query.subjectId){
+    if(!await ownedSubject(req.query.subjectId,req.user))return res.status(403).json({error:'You do not have access to this subject'});
+    query.subjectId=req.query.subjectId;
+    if(req.query.studentId)query.studentId=req.query.studentId;
+  }else query.subjectId={$in:await Subject.distinct('_id',{facultyId:req.user.userId})};
+  if(req.query.subjectId&&req.user.role==='student')query.subjectId=req.query.subjectId;
+  if(req.query.topicId)query.topicId=req.query.topicId;
+  res.json({scores:await Score.find(query).populate('studentId','fullName studentId yearLevel section').populate('quizId','title').sort({topicNumber:1,createdAt:-1})});
+});
+app.post('/api/scores',auth,role('student'),async(req,res)=>{
+  const quiz=await Quiz.findById(req.body.quizId);
+  if(!quiz)return res.status(404).json({error:'Quiz not found'});
+  if(!quiz.isActive)return res.status(400).json({error:'This quiz is not currently available'});
+  if(!await ownedSubject(quiz.subjectId,req.user))return res.status(403).json({error:'You do not have access to this quiz'});
+  const topic=await Topic.findOne({_id:quiz.topicId,subjectId:quiz.subjectId});
+  if(!topic)return res.status(404).json({error:'Quiz topic not found'});
+  const topicNumber=Number(topic.topicNumber);
+  if(!await studentCanAccessQuiz(quiz,req.user.userId))return res.status(403).json({error:`Pass Topic ${topicNumber-1} before taking this quiz`});
+  let rawScore=0,totalPoints=0;
+  const answers=[];
+  for(const question of quiz.questions){
+    const answer=String((req.body.answers||{})[question._id.toString()]||'').trim();
+    const isCorrect=answer.toLowerCase()===String(question.correctAnswer||'').trim().toLowerCase();
+    const points=Number(question.points)||1;
+    totalPoints+=points;
+    if(isCorrect)rawScore+=points;
+    answers.push({questionId:question._id,answer,isCorrect});
+  }
+  if(!totalPoints)return res.status(400).json({error:'This quiz has no scorable questions'});
+  const percentage=Math.round(rawScore/totalPoints*100);
+  const passed=percentage>=quiz.passingScore;
+  const attemptNumber=await Score.countDocuments({studentId:req.user.userId,quizId:quiz._id})+1;
+  const score=await Score.create({
+    studentId:req.user.userId,quizId:quiz._id,topicId:topic._id,subjectId:quiz.subjectId,topicNumber,
+    rawScore,totalPoints,percentage,passed,answers,timeTaken:Math.max(0,Number(req.body.timeTaken)||0),attemptNumber
+  });
+  const message=passed
+    ?`Congratulations! You scored ${percentage}%. ${topicNumber<6?`Topic ${topicNumber+1} unlocked.`:'You completed the learning path.'}`
+    :`Score ${percentage}% is below the ${quiz.passingScore}% passing mark. Review the topic content and retry.`;
+  res.status(201).json({score:{...score.toObject(),message}});
+});
+app.get('/api/scores/matrix',auth,role('faculty'),async(req,res)=>{
+  const subjectId=req.query.subjectId;
+  if(!subjectId)return res.status(400).json({error:'subjectId is required'});
+  const subject=await Subject.findOne({_id:subjectId,facultyId:req.user.userId}).populate('enrolledStudents','fullName studentId');
+  if(!subject)return res.status(403).json({error:'You do not have access to this subject'});
+  const scores=await Score.find({subjectId}).populate('studentId','fullName studentId').sort({createdAt:-1});
+  const matrix=new Map();
+  const passedTopics=new Map();
+  for(const student of subject.enrolledStudents){
+    const key=String(student._id);
+    matrix.set(key,{studentName:student.fullName,studentId:student.studentId||'',scores:{},overall:0,status:'INCOMPLETE'});
+    passedTopics.set(key,new Set());
+  }
+  for(const score of scores){
+    const student=score.studentId;
+    if(!student)continue;
+    const key=String(student._id);
+    if(!matrix.has(key)){
+      matrix.set(key,{studentName:student.fullName,studentId:student.studentId||'',scores:{},overall:0,status:'INCOMPLETE'});
+      passedTopics.set(key,new Set());
+    }
+    const row=matrix.get(key);
+    row.scores[score.topicNumber]=Math.max(row.scores[score.topicNumber]||0,score.percentage);
+    if(score.passed)passedTopics.get(key).add(Number(score.topicNumber));
+  }
+  const rows=[...matrix.entries()].map(([studentKey,row])=>{
+    const values=[1,2,3,4,5,6].map(number=>row.scores[number]).filter(value=>typeof value==='number');
+    row.overall=values.length?Math.round(values.reduce((a,b)=>a+b,0)/6):0;
+    row.status=passedTopics.get(studentKey)?.size===6?'PASSED':'INCOMPLETE';
+    return row;
+  });
+  res.json({matrix:rows});
+});
 app.post('/api/uploads',auth,role('faculty'),upload.single('file'),(req,res)=>{if(!req.file)return res.status(400).json({error:'File is required'});res.status(201).json({url:`${process.env.PUBLIC_API_URL||`http://localhost:${port}`}/uploads/${req.file.filename}`,filename:req.file.originalname});});
 connectDb().then(()=>app.listen(port,()=>console.log(`GROUP9 API listening on ${port}`))).catch(error=>{console.error('Database connection failed:',error);process.exit(1);});

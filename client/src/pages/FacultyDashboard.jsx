@@ -1,5 +1,5 @@
 import {Link} from 'react-router-dom';
-import {useEffect,useState} from 'react';
+import {useCallback,useEffect,useState} from 'react';
 import {motion} from 'framer-motion';
 import {BarChart3,BookOpen,ChevronRight,FilePlus2,GraduationCap,LayoutDashboard,LogOut,Menu,Plus,Settings2,UserRound,X} from 'lucide-react';
 import {useAuth} from '../context/AuthContext';
@@ -13,12 +13,11 @@ export default function FacultyDashboard(){
   const [subjects,setSubjects]=useState([]);
   const [form,setForm]=useState(initialForm);
   const [mobileOpen,setMobileOpen]=useState(false);
-  const [message,setMessage]=useState('');
   const [error,setError]=useState('');
   const [creating,setCreating]=useState(false);
-  const load=()=>api('/subjects').then(data=>setSubjects(data.subjects||[])).catch(err=>setError(err.message));
-  useEffect(()=>{load();},[]);
-  const createSubject=async event=>{event.preventDefault();setCreating(true);setMessage('');setError('');try{await api('/subjects',{method:'POST',body:JSON.stringify(form)});setForm(initialForm);setMessage('');notify('Subject created successfully. Refreshing...');window.setTimeout(()=>window.location.reload(),800);}catch(err){setError(err.message);notify(err.message,'error');}finally{setCreating(false);}};
+  const load=useCallback(()=>api('/subjects').then(data=>setSubjects(data.subjects||[])).catch(err=>setError(err.message)),[]);
+  useEffect(()=>{load();},[load]);
+  const createSubject=async event=>{event.preventDefault();setCreating(true);setError('');try{await api('/subjects',{method:'POST',body:JSON.stringify(form)});setForm(initialForm);notify('Subject created successfully. Refreshing...');window.setTimeout(()=>window.location.reload(),800);}catch(err){setError(err.message);notify(err.message,'error');}finally{setCreating(false);}};
   const closeMobile=()=>setMobileOpen(false);
   const sidebar=<aside className={`faculty-sidebar ${mobileOpen?'is-open':''}`}>
     <div className="faculty-sidebar-head"><Link to="/faculty/dashboard" className="faculty-brand" onClick={closeMobile}><span className="faculty-brand-mark"><GraduationCap size={19}/></span><span><b>GROUP9</b><small>TUP Faculty Hub</small></span></Link><button className="faculty-sidebar-close" onClick={closeMobile} aria-label="Close navigation"><X size={18}/></button></div>
